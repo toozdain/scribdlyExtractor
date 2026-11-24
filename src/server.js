@@ -54,12 +54,19 @@ function requireSecret(req, res, next) {
   next();
 }
 
+// ─── Worker Concurrency & Busy State ────────────────
+// Enforce rule: 1 worker should get only one part at a time
+let isExtracting = false;
+let currentJobInfo = null;
+
 // ─── Health check (public, no auth) ─────────────────
 app.get('/health', (req, res) => {
   const fs = require('fs');
   const os = require('os');
   res.json({
     status: 'ok',
+    busy: isExtracting,
+    currentJob: currentJobInfo,
     replica: REPLICA_ID,
     worker: process.env.WORKER_ID || 'scribdly-worker',
     uptime: Math.round(process.uptime()),
@@ -69,16 +76,6 @@ app.get('/health', (req, res) => {
     chromeExists: fs.existsSync('/usr/bin/google-chrome-stable'),
   });
 });
-
-// ─── Extraction Queue ────────────────────────────────
-// Serializes extractions so one extraction does not starve or crash the container
-let extractionQueue = Promise.resolve();
-
-function enqueueExtraction(fn) {
-  const result = extractionQueue.then(fn, fn);
-  extractionQueue = result.catch(() => { });
-  return result;
-}
 
 // ─── Fast Document Metadata Inspection ───────────────
 /**
@@ -96,9 +93,7 @@ app.post('/inspect', requireSecret, async (req, res) => {
   }
 
   try {
-    const info = await enqueueExtraction(async () => {
-      return inspectDocumentInfo(String(documentId), html || null);
-    });
+    const info = await inspectDocumentInfo(String(documentId), html || null);
     res.status(200).json({ success: true, ...info });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -125,27 +120,37 @@ app.post('/extract', requireSecret, async (req, res) => {
   }
 
   const rangeStr = startPage || endPage ? ` [pages ${startPage || 1}..${endPage || 'end'}]` : '';
+
+  // Strict concurrency guard: 1 worker gets only one part at a time
+  if (isExtracting) {
+    console.warn(
+      `${tag} [Worker] ⛔ Rejected extraction for ${documentId}${rangeStr}: worker is already extracting ${currentJobInfo || 'another part'} (1 part at a time rule)`
+    );
+    return res.status(429).json({
+      success: false,
+      busy: true,
+      message: `Worker replica ${REPLICA_ID} is currently busy processing ${currentJobInfo || 'another part'}. 1 part at a time only.`,
+      replica: REPLICA_ID,
+    });
+  }
+
+  isExtracting = true;
+  currentJobInfo = `doc ${documentId}${rangeStr}`;
+
   console.log(
-    `${tag} [Worker] Queued extraction for document ${documentId}${rangeStr}${html ? ' (with pre-resolved HTML)' : ''}`
+    `${tag} [Worker] Starting extraction for document ${documentId}${rangeStr}${html ? ' (with pre-resolved HTML)' : ''}`
   );
-  const queuedAt = Date.now();
-  let startedAt = queuedAt;
+  const startedAt = Date.now();
 
   try {
-    const result = await enqueueExtraction(async () => {
-      startedAt = Date.now();
-      return extractToPdfBuffer(String(documentId), html || null, startPage || null, endPage || null);
-    });
+    const result = await extractToPdfBuffer(String(documentId), html || null, startPage || null, endPage || null);
 
     const { pdfBuffer, totalPages, thumbnailUrl, startPage: fromP, endPage: toP, partPages } = result;
 
     const executionElapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
-    const totalElapsed = ((Date.now() - queuedAt) / 1000).toFixed(1);
-    const queueWaitMs = startedAt - queuedAt;
-    const waitStr = queueWaitMs > 500 ? ` (queue wait: ${(queueWaitMs / 1000).toFixed(1)}s)` : '';
 
     console.log(
-      `${tag} [Worker] ✅ Extracted ${partPages || totalPages} pages (range ${fromP || 1}..${toP || totalPages}) in ${executionElapsed}s${waitStr} — ${pdfBuffer.length} bytes`
+      `${tag} [Worker] ✅ Extracted ${partPages || totalPages} pages (range ${fromP || 1}..${toP || totalPages}) in ${executionElapsed}s — ${pdfBuffer.length} bytes`
     );
 
     // Return PDF binary with metadata headers so the base VPS can read them
@@ -156,22 +161,24 @@ app.post('/extract', requireSecret, async (req, res) => {
     res.setHeader('X-End-Page', toP || totalPages);
     res.setHeader('X-Part-Pages', partPages || totalPages);
     res.setHeader('X-Thumbnail-Url', thumbnailUrl || '');
+    res.setHeader('X-Replica-Id', REPLICA_ID);
     res.setHeader('X-Elapsed-Seconds', executionElapsed);
-    res.setHeader('X-Total-Seconds', totalElapsed);
     res.status(200).send(pdfBuffer);
   } catch (err) {
     const executionElapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
-    const totalElapsed = ((Date.now() - queuedAt) / 1000).toFixed(1);
     console.error(
-      `${tag} [Worker] ❌ Extraction failed for ${documentId} after ${executionElapsed}s (total ${totalElapsed}s):`,
+      `${tag} [Worker] ❌ Extraction failed for ${documentId} after ${executionElapsed}s:`,
       err.message
     );
     res.status(500).json({
       success: false,
       message: err.message || 'Extraction failed.',
       elapsed: executionElapsed,
-      totalElapsed,
+      replica: REPLICA_ID,
     });
+  } finally {
+    isExtracting = false;
+    currentJobInfo = null;
   }
 });
 
